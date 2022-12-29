@@ -1,0 +1,49 @@
+cmake_minimum_required(VERSION 3.20)
+project(trim-winboot)
+
+enable_language(ASM_NASM)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(lz4 REQUIRED IMPORTED_TARGET liblz4)
+
+add_executable(makebin EXCLUDE_FROM_ALL makebin.cpp)
+
+set_target_properties(makebin PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED TRUE
+)
+add_executable(trim-winboot
+    CompressionStream.cpp
+    CompressionStream.h
+    DOSTypes.h
+    main.cpp
+    WinbootImage.cpp
+    WinbootImage.h
+    ${CMAKE_CURRENT_BINARY_DIR}/msload_extension.h
+)
+
+set_target_properties(trim-winboot PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED TRUE
+)
+target_link_libraries(trim-winboot PRIVATE PkgConfig::lz4)
+target_include_directories(trim-winboot PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+add_custom_command(
+    OUTPUT
+        ${CMAKE_CURRENT_BINARY_DIR}/msload_extension.bin
+        ${CMAKE_CURRENT_BINARY_DIR}/msload_extension.h
+    COMMAND
+        ${CMAKE_ASM_NASM_COMPILER}
+        -fbin
+        -o ${CMAKE_CURRENT_BINARY_DIR}/msload_extension.bin
+        ${CMAKE_CURRENT_SOURCE_DIR}/msload_extension.asm
+    COMMAND
+        makebin
+        ${CMAKE_CURRENT_BINARY_DIR}/msload_extension.bin
+        ${CMAKE_CURRENT_BINARY_DIR}/msload_extension.h
+        msload_extension
+    MAIN_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/msload_extension.asm
+    DEPENDS $<TARGET_FILE:makebin>
+    VERBATIM
+)
