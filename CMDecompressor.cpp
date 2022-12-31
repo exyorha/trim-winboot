@@ -231,7 +231,7 @@ std::vector<unsigned char> cmDecompress(const unsigned char *data, size_t size) 
         if((emu->x86.R_FLG & FB_CF) != 0)
             throw std::logic_error("the decompressor has failed");
 
-        if(emu->x86.R_SI != compressedDataLength && emu->x86.R_SI != compressedDataLength + 1)
+        if(emu->x86.R_SI < compressedDataLength)
             throw std::logic_error("the decompressor didn't consume the expected amount of data");
 
         if(emu->x86.R_DI != uncompressedDataLength)
