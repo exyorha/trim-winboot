@@ -36,6 +36,11 @@ public:
     void removeLogo();
 
 private:
+    enum class Version {
+        DOS7,
+        DOS8
+    };
+
     EXEHeader *getEXEHeader(bool evenIfInvalid = false);
     size_t dosSizeParagraphs();
     size_t dosSizeBytes();
@@ -49,6 +54,7 @@ private:
     static constexpr size_t MSLOADSize = 0x800;
 
     std::vector<unsigned char> m_data;
+    Version m_version;
 };
 
 #endif

@@ -6,6 +6,7 @@
 #include "DOSTypes.h"
 #include "CompressionStream.h"
 #include "msload_extension.h"
+#include "CMDecompressor.h"
 
 #include <lz4hc.h>
 
@@ -63,35 +64,87 @@ void WinbootImage::load(std::vector<unsigned char> &&data) {
 
     static_assert(std::endian::native == std::endian::little, "Little-endian system is expected");
 
-    /*
-     * winboot.sys is a dual-start executable: it a normal DOS exe, containing
-     * an EXEPack-compressed a component named 'MSDCM' in the EXE structure, and
-     * the MS-DOS kernel (IO.SYS/MSDOS.SYS combo) inside what's functionally is
-     * the EXE header. 'MSDCM' is only needed to start Windows.
-     */
-    auto exe = getEXEHeader();
+    auto exe = getEXEHeader(true);
 
-    if(exe->e_cblp < 1) {
-        throw std::logic_error("e_cblp indicates zero pages");
+    if(exe->e_magic == EXEHeaderMagic && exe->e_cp == 0) {
+        /*
+         * MS-DOS 8 is monolithic, but has a vestigial 'MZ' header:
+         * the 'MZ' signature is present, and e_cparhdr is still used to size
+         * the DOS portion, but the rest of the header is zeroed out.
+         */
+
+        m_version = Version::DOS8;
+
+        printf("This is a MS-DOS 8 WINBOOT.\n");
+
+        /*
+         * Is this a compressed image?
+         */
+        auto size = dosSizeBytes();
+
+        if(size < MSLOADSize) {
+            throw std::logic_error("DOS is too short doesn't fit the MSLOAD");
+        }
+
+        auto payload = m_data.data() + MSLOADSize;
+        auto payloadSize = size - MSLOADSize;
+
+        if(isCMCompressed(payload, payloadSize)) {
+            printf("The payload is 'CM' compressed.\n");
+
+            auto decompressed = cmDecompress(payload, payloadSize);
+
+            if((decompressed.size() & 15) != 0)
+                throw std::logic_error("decompressed data length is not paragraph-aligned");
+
+            m_data.resize(MSLOADSize + decompressed.size());
+
+            memcpy(m_data.data() + MSLOADSize, decompressed.data(), decompressed.size());
+
+            exe = getEXEHeader(true);
+            exe->e_cparhdr = (m_data.size() + 512) / 16;
+
+            printf("Decompressed to %zu bytes\n", decompressed.size());
+        }
+
+    } else {
+        /*
+        * MS-DOS 7 winboot.sys is a dual-start executable: it a normal DOS
+        * exe, containing an EXEPack-compressed a component named 'MSDCM' in
+        * the EXE structure, and the MS-DOS kernel (IO.SYS/MSDOS.SYS combo)
+        * inside what's functionally is the EXE header. 'MSDCM' is only needed
+        * to start Windows.
+        */
+
+        exe = getEXEHeader();
+
+        m_version = Version::DOS7;
+
+        printf("This is a MS-DOS 7 WINBOOT.\n");
+
+        if(exe->e_cp < 1) {
+            throw std::logic_error("e_cp indicates zero pages");
+        }
+
+        auto totalExeSize = 512 * exe->e_cp;
+
+        if(exe->e_cblp != 0) {
+            totalExeSize = totalExeSize - 512 + exe->e_cblp;
+        }
+
+        if(totalExeSize != m_data.size()) {
+            std::stringstream error;
+            error << "exe size doesn't match: " << totalExeSize << " indicated ("
+                << exe->e_cp << " 512-byte pages, " << exe->e_cblp << " bytes "
+                "in the last page), but actual file size is " << m_data.size()
+                << " bytes";
+
+            throw std::logic_error(error.str());
+        }
     }
 
-    auto totalExeSize = 512 * exe->e_cp;
-
-    if(exe->e_cblp != 0) {
-        totalExeSize = totalExeSize - 512 + exe->e_cblp;
-    }
-
-    if(totalExeSize != m_data.size()) {
-        std::stringstream error;
-        error << "exe size doesn't match: " << totalExeSize << " indicated ("
-              << exe->e_cp << " 512-byte pages, " << exe->e_cblp << " bytes "
-              "in the last page), but actual file size is " << m_data.size()
-              << " bytes";
-
-        throw std::logic_error(error.str());
-    }
-
-    if(dosSizeBytes() > totalExeSize) {
+    if(dosSizeBytes() > m_data.size()) {
+        printf("dos size bytes: %zu, image size: %zu\n", dosSizeBytes(), m_data.size());
         throw std::logic_error("EXE header (DOS) portion overruns the executable");
     }
 }
@@ -103,7 +156,7 @@ EXEHeader *WinbootImage::getEXEHeader(bool evenIfInvaid) {
         header = reinterpret_cast<EXEHeader *>(m_data.data());
     }
 
-    if(!header || (!evenIfInvaid && header->e_magic != EXEHeaderMagic))
+    if(!header || (!evenIfInvaid && (header->e_magic != EXEHeaderMagic || header->e_cp != 0)))
         throw std::logic_error("winboot has no MZ header. Already removed?");
 
     return header;
@@ -117,7 +170,17 @@ size_t WinbootImage::dosSizeParagraphs() {
      * it, so we access the MZ header without validity checks.
      */
 
-    return getEXEHeader(true)->e_cparhdr;
+    auto size = getEXEHeader(true)->e_cparhdr;
+
+    if(m_version == Version::DOS8) {
+        if(size < 32) {
+            throw std::logic_error("DOS size is less than the expected bias");
+        }
+
+        size -= 32;
+    }
+
+    return size;
 }
 
 size_t WinbootImage::dosSizeBytes() {
@@ -133,175 +196,187 @@ void WinbootImage::extractMSDCM(const std::filesystem::path &path) {
 }
 
 void WinbootImage::extractMSDCM(std::ostream &stream) {
-    static constexpr size_t exeHeaderAllocationBytes = 32;
-    static constexpr size_t exeHeaderAllocationParagraphs = exeHeaderAllocationBytes / 16;
+    if(m_version == Version::DOS7) {
+        static constexpr size_t exeHeaderAllocationBytes = 32;
+        static constexpr size_t exeHeaderAllocationParagraphs = exeHeaderAllocationBytes / 16;
 
-    static_assert(exeHeaderAllocationBytes >= sizeof(EXEHeader), "EXE header allocation needs to be increased");
+        static_assert(exeHeaderAllocationBytes >= sizeof(EXEHeader), "EXE header allocation needs to be increased");
 
-    auto originalHeaderParagraphs = dosSizeParagraphs();
-    auto originalHeaderBytes = 16 * originalHeaderParagraphs;
+        auto originalHeaderParagraphs = dosSizeParagraphs();
+        auto originalHeaderBytes = 16 * originalHeaderParagraphs;
 
-    if(originalHeaderBytes < exeHeaderAllocationBytes) {
-        throw std::logic_error("EXE header allocation needs to be decreased");
+        if(originalHeaderBytes < exeHeaderAllocationBytes) {
+            throw std::logic_error("EXE header allocation needs to be decreased");
+        }
+
+        auto exeHeader = getEXEHeader();
+
+        /*
+        * We are shrinking the EXE header area from originalHeaderBytes to
+        * exeHeaderAllocation.
+        */
+
+        std::vector<char> header(exeHeaderAllocationBytes);
+        auto newExe = reinterpret_cast<EXEHeader *>(header.data());
+
+        auto newTotalSize = m_data.size() - originalHeaderBytes + exeHeaderAllocationBytes;
+
+        *newExe = *exeHeader;
+        newExe->e_cparhdr = exeHeaderAllocationParagraphs;
+        newExe->e_cp = (newTotalSize + 511) / 512;
+        newExe->e_cblp = newTotalSize & 511;
+        if(newExe->e_crlc != 0) {
+            throw std::logic_error("MSDCM contains relocations, which are not currently supported");
+        }
+
+        stream.write(header.data(), header.size());
+        stream.write(reinterpret_cast<const char *>(m_data.data()) + originalHeaderBytes, m_data.size() - originalHeaderBytes);
+    } else {
+        throw std::logic_error("MSDCM cannot be extracted from this DOS version");
     }
-
-    auto exeHeader = getEXEHeader();
-
-    /*
-     * We are shrinking the EXE header area from originalHeaderBytes to
-     * exeHeaderAllocation.
-     */
-
-    std::vector<char> header(exeHeaderAllocationBytes);
-    auto newExe = reinterpret_cast<EXEHeader *>(header.data());
-
-    auto newTotalSize = m_data.size() - originalHeaderBytes + exeHeaderAllocationBytes;
-
-    *newExe = *exeHeader;
-    newExe->e_cparhdr = exeHeaderAllocationParagraphs;
-    newExe->e_cp = (newTotalSize + 511) / 512;
-    newExe->e_cblp = newTotalSize & 511;
-    if(newExe->e_crlc != 0) {
-        throw std::logic_error("MSDCM contains relocations, which are not currently supported");
-    }
-
-    stream.write(header.data(), header.size());
-    stream.write(reinterpret_cast<const char *>(m_data.data()) + originalHeaderBytes, m_data.size() - originalHeaderBytes);
 }
 
 void WinbootImage::removeMSDCM() {
-    auto exeHeader = getEXEHeader(true);
+    if(m_version == Version::DOS7) {
+        auto exeHeader = getEXEHeader(true);
 
-    /*
-     * To remove MSDCM, we truncate the whole image to only preserve the DOS
-     * portion, and then zero out the first sector, containing the MZ header
-     * (except e_cparhdr, which we need to preserve for MSLOAD) to make sure
-     * that WINBOOT.SYS fails when trying to load MSDCM.
-     */
+        /*
+        * To remove MSDCM, we truncate the whole image to only preserve the DOS
+        * portion, and then zero out the first sector, containing the MZ header
+        * (except e_cparhdr, which we need to preserve for MSLOAD) to make sure
+        * that WINBOOT.SYS fails when trying to load MSDCM.
+        */
 
-    auto savedSize = exeHeader->e_cparhdr;
+        auto savedSize = exeHeader->e_cparhdr;
 
-    m_data.resize(16 * savedSize);
+        m_data.resize(16 * savedSize);
 
-    memset(exeHeader, 0, 512);
+        memset(exeHeader, 0, 512);
 
-    exeHeader->e_cparhdr = savedSize;
+        exeHeader->e_cparhdr = savedSize;
+    } else {
+        throw std::logic_error("MSDCM cannot be removed from this DOS version");
+    }
 }
 
 
 void WinbootImage::compress() {
-    /*
-     * Get the DOS ('payload') portion.
-     */
-    auto dosSize = dosSizeBytes();
-    if(dosSize < MSLOADSize + 2) {
-        throw std::logic_error("DOS portion is too short (doesn't fit the MSLOAD)");
+    if(m_version == Version::DOS7) {
+        /*
+        * Get the DOS ('payload') portion.
+        */
+        auto dosSize = dosSizeBytes();
+        if(dosSize < MSLOADSize + 2) {
+            throw std::logic_error("DOS portion is too short (doesn't fit the MSLOAD)");
+        }
+
+        auto payload = m_data.data() + MSLOADSize;
+        auto payloadSize = dosSize - MSLOADSize;
+
+        static constexpr uint16_t LZMagic = 0x5A4C; // 'LZ'
+
+        if(*reinterpret_cast<const uint16_t *>(payload) == LZMagic) {
+            throw std::logic_error("WINBOOT.SYS is already LZ-compressed");
+        }
+
+        /*
+        * Pack LZ4 into a compact framed format:
+        * 2 bytes: 0x5A4C ('LZ')
+        * 2 bytes: source size, paragraphs
+        * zero or more blocks:
+        *   2 bytes: compressed length, bytes
+        *   the specified number of bytes
+        * 2 bytes: zero
+        */
+
+        //LZ4HC_CLEVEL_MAX;
+
+        CompressionStream outputStream;
+
+        /*
+        * Stream header
+        */
+        outputStream.reserveOutputBytes(4); // header
+
+        unsigned char *headerData;
+        outputStream.getAvailableArea(headerData);
+
+        reinterpret_cast<uint16_t *>(headerData)[0] = LZMagic;
+        reinterpret_cast<uint16_t *>(headerData)[1] = payloadSize / 16;
+
+        outputStream.advanceOutputPointer(4);
+
+        static constexpr size_t blockSize = 63 * 1024;
+        for(size_t pos = 0; pos < payloadSize; pos += blockSize) {
+            auto chunk = std::min<size_t>(blockSize, payloadSize - pos);
+
+            outputStream.reserveOutputBytes(2 + LZ4_compressBound(chunk));
+
+            unsigned char *blockData;
+            size_t blockDataLength = outputStream.getAvailableArea(blockData);
+
+            auto result = LZ4_compress_HC(
+                reinterpret_cast<const char *>(payload + pos),
+                reinterpret_cast<char *>(blockData + 2),
+                chunk,
+                blockDataLength - 2,
+                LZ4HC_CLEVEL_MAX
+            );
+            if(result <= 0)
+                throw std::logic_error("LZ4_compress_HC failed");
+
+            if(result > blockSize)
+                throw std::logic_error("LZ4-compressed block length exceeds the limit");
+
+            *reinterpret_cast<uint16_t *>(blockData) = static_cast<uint16_t>(result);
+
+            outputStream.advanceOutputPointer(2 + result);
+        }
+
+        /*
+        * Stream terminator
+        */
+        unsigned char *terminatorData;
+        outputStream.getAvailableArea(terminatorData);
+
+        reinterpret_cast<uint16_t *>(terminatorData)[0] = 0;
+        outputStream.advanceOutputPointer(2);
+
+        auto compressedPayload = outputStream.finish();
+        if(compressedPayload.size() > payloadSize) {
+            throw std::logic_error("compressed payload length exceeds the uncompressed length");
+        }
+
+        /*
+        * Transplant the compressed payload back in.
+        */
+
+        memcpy(m_data.data() + MSLOADSize, compressedPayload.data(), compressedPayload.size());
+
+        /*
+        * Update file sizes, relocate MSDCM (if present).
+        */
+        cutDOSAt(MSLOADSize + compressedPayload.size());
+
+        /*
+        * Now, insert our unpacking extension into MSLOAD.
+        */
+
+        static constexpr size_t msloadFinalBranchPos = 0x4EB;
+        static constexpr size_t msloadExtensionPos   = 0x701;
+
+        memcpy(m_data.data() + msloadExtensionPos, msload_extension, sizeof(msload_extension));
+
+        /*
+        * And patch the final branch into the payload to pass control into our
+        * extension instead.
+        */
+        unsigned char *finalBranch = &m_data[msloadFinalBranchPos];
+        finalBranch[0] = 0xE9; // JMP NEAR
+        *reinterpret_cast<int16_t *>(&finalBranch[1]) = msloadExtensionPos - (msloadFinalBranchPos + 3);
+    } else {
+        throw std::logic_error("compression is not yet supported for this DOS version");
     }
-
-    auto payload = m_data.data() + MSLOADSize;
-    auto payloadSize = dosSize - MSLOADSize;
-
-    static constexpr uint16_t LZMagic = 0x5A4C; // 'LZ'
-
-    if(*reinterpret_cast<const uint16_t *>(payload) == LZMagic) {
-        throw std::logic_error("WINBOOT.SYS is already LZ-compressed");
-    }
-
-    /*
-     * Pack LZ4 into a compact framed format:
-     * 2 bytes: 0x5A4C ('LZ')
-     * 2 bytes: source size, paragraphs
-     * zero or more blocks:
-     *   2 bytes: compressed length, bytes
-     *   the specified number of bytes
-     * 2 bytes: zero
-     */
-
-    //LZ4HC_CLEVEL_MAX;
-
-    CompressionStream outputStream;
-
-    /*
-     * Stream header
-     */
-    outputStream.reserveOutputBytes(4); // header
-
-    unsigned char *headerData;
-    outputStream.getAvailableArea(headerData);
-
-    reinterpret_cast<uint16_t *>(headerData)[0] = LZMagic;
-    reinterpret_cast<uint16_t *>(headerData)[1] = payloadSize / 16;
-
-    outputStream.advanceOutputPointer(4);
-
-    static constexpr size_t blockSize = 63 * 1024;
-    for(size_t pos = 0; pos < payloadSize; pos += blockSize) {
-        auto chunk = std::min<size_t>(blockSize, payloadSize - pos);
-
-        outputStream.reserveOutputBytes(2 + LZ4_compressBound(chunk));
-
-        unsigned char *blockData;
-        size_t blockDataLength = outputStream.getAvailableArea(blockData);
-
-        auto result = LZ4_compress_HC(
-            reinterpret_cast<const char *>(payload + pos),
-            reinterpret_cast<char *>(blockData + 2),
-            chunk,
-            blockDataLength - 2,
-            LZ4HC_CLEVEL_MAX
-        );
-        if(result <= 0)
-            throw std::logic_error("LZ4_compress_HC failed");
-
-        if(result > blockSize)
-            throw std::logic_error("LZ4-compressed block length exceeds the limit");
-
-        *reinterpret_cast<uint16_t *>(blockData) = static_cast<uint16_t>(result);
-
-        outputStream.advanceOutputPointer(2 + result);
-    }
-
-    /*
-     * Stream terminator
-     */
-    unsigned char *terminatorData;
-    outputStream.getAvailableArea(terminatorData);
-
-    reinterpret_cast<uint16_t *>(terminatorData)[0] = 0;
-    outputStream.advanceOutputPointer(2);
-
-    auto compressedPayload = outputStream.finish();
-    if(compressedPayload.size() > payloadSize) {
-        throw std::logic_error("compressed payload length exceeds the uncompressed length");
-    }
-
-    /*
-     * Transplant the compressed payload back in.
-     */
-
-    memcpy(m_data.data() + MSLOADSize, compressedPayload.data(), compressedPayload.size());
-
-    /*
-     * Update file sizes, relocate MSDCM (if present).
-     */
-    cutDOSAt(MSLOADSize + compressedPayload.size());
-
-    /*
-     * Now, insert our unpacking extension into MSLOAD.
-     */
-
-    static constexpr size_t msloadFinalBranchPos = 0x4EB;
-    static constexpr size_t msloadExtensionPos   = 0x701;
-
-    memcpy(m_data.data() + msloadExtensionPos, msload_extension, sizeof(msload_extension));
-
-    /*
-     * And patch the final branch into the payload to pass control into our
-     * extension instead.
-     */
-    unsigned char *finalBranch = &m_data[msloadFinalBranchPos];
-    finalBranch[0] = 0xE9; // JMP NEAR
-    *reinterpret_cast<int16_t *>(&finalBranch[1]) = msloadExtensionPos - (msloadFinalBranchPos + 3);
 }
 
 void WinbootImage::cutDOSAt(size_t newSize) {
@@ -317,11 +392,14 @@ void WinbootImage::cutDOSAt(size_t newSize) {
 
     auto header = getEXEHeader(true);
 
-    bool hasMSDCM = header->e_magic == EXEHeaderMagic;
+    bool hasMSDCM = header->e_magic == EXEHeaderMagic && header->e_cp != 0;
+
+    auto moveup = oldSize - newSize;
+
+    header->e_cparhdr -= moveup / 16;
 
     if(hasMSDCM) {
         auto msdcmSize = m_data.size() - oldSize;
-        auto moveup = oldSize - newSize;
 
         printf("MSDCM: relocating MSDCM body, %zu bytes, from %zu to %zu, moveup %zu bytes\n",
                msdcmSize, oldSize, newSize, moveup);
@@ -338,38 +416,39 @@ void WinbootImage::cutDOSAt(size_t newSize) {
 
         header->e_cp = (newFullSize + 511) / 512;
         header->e_cblp = (newFullSize & 511);
-        header->e_cparhdr -= moveup / 16;
         if(header->e_crlc != 0) {
             throw std::logic_error("MSDCM contains relocations, which are not currently supported");
         }
 
         m_data.resize(newFullSize);
     } else {
-        header->e_cparhdr = newSize / 16;
-
         m_data.resize(newSize);
     }
 }
 
 void WinbootImage::removeLogo() {
-    /*
-     * First,  we need to figure out where the logo starts.
-     */
-    static constexpr size_t dosFixedPortionInParagraphs = 0x12D5; // From the IO.SYS-proper portion of WINBOOT.SYS
-    static constexpr size_t dosDynamicPortionLengthOffset = 0x803;
+    if(m_version == Version::DOS7) {
+        /*
+        * First,  we need to figure out where the logo starts.
+        */
+        static constexpr size_t dosFixedPortionInParagraphs = 0x12D5; // From the IO.SYS-proper portion of WINBOOT.SYS
+        static constexpr size_t dosDynamicPortionLengthOffset = 0x803;
 
-    auto fullDosSize = dosSizeBytes(); // DOS size including the logo, if any
+        auto fullDosSize = dosSizeBytes(); // DOS size including the logo, if any
 
-    if(fullDosSize < dosFixedPortionInParagraphs * 16) {
-        throw std::logic_error("WINBOOT.SYS is too short: doesn't fit IO.SYS");
-    }
+        if(fullDosSize < dosFixedPortionInParagraphs * 16) {
+            throw std::logic_error("WINBOOT.SYS is too short: doesn't fit IO.SYS");
+        }
 
-    size_t dosDynamicPortionInBytes = *reinterpret_cast<const uint16_t *>(&m_data[dosDynamicPortionLengthOffset]);
+        size_t dosDynamicPortionInBytes = *reinterpret_cast<const uint16_t *>(&m_data[dosDynamicPortionLengthOffset]);
 
-    size_t realDOSSize = dosFixedPortionInParagraphs * 16 + dosDynamicPortionInBytes + 0x800 - 0x700;
-    if(realDOSSize > fullDosSize) {
-        throw std::logic_error("WINBOOT.SYS is too short: doesn't fit IO.SYS+MSDOS.SYS");
-    } else if(realDOSSize < fullDosSize) {
-        cutDOSAt(realDOSSize);
+        size_t realDOSSize = dosFixedPortionInParagraphs * 16 + dosDynamicPortionInBytes + 0x800 - 0x700;
+        if(realDOSSize > fullDosSize) {
+            throw std::logic_error("WINBOOT.SYS is too short: doesn't fit IO.SYS+MSDOS.SYS");
+        } else if(realDOSSize < fullDosSize) {
+            cutDOSAt(realDOSSize);
+        }
+    } else {
+        throw std::logic_error("logo removal is not yet supported for this DOS version");
     }
 }
